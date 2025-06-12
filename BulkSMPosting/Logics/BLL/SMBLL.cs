@@ -8,7 +8,7 @@ using Microsoft.IdentityModel.Protocols;
 
 namespace BulkSMPosting.Logics.BLL
 {
-    public class SMBLL:BaseBLL
+    public class SMBLL : BaseBLL
     {
         private readonly IConfiguration _configuration;
         SqlTransaction tr = null;
@@ -17,8 +17,10 @@ namespace BulkSMPosting.Logics.BLL
             _configuration = configuration;
         }
         public async Task SMPost()
-         {
-            using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString("defaultconnection")))
+        {
+            string activeKey = _configuration.GetSection("ConnectionStrings:active").Value;
+
+            using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString(activeKey)))
             {
                 await con.OpenAsync();
                 try
@@ -65,10 +67,10 @@ namespace BulkSMPosting.Logics.BLL
                                 result = Convert.ToInt32(cmds.ExecuteScalar() ?? 0);
                             }
 
-                                //2.s check in sm table already posted or not  
-                                cmd.CommandText = @"select 1 from SM WHERE CODE=@SmCode";
-                                IsPosted = Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
-                            
+                            //2.s check in sm table already posted or not  
+                            cmd.CommandText = @"select 1 from SM WHERE CODE=@SmCode";
+                            IsPosted = Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
+
 
                             //3.if this candition is true then this part of code is run
                             if (result > 0 || paymentdate != null && IsPosted == 0)
@@ -155,7 +157,7 @@ namespace BulkSMPosting.Logics.BLL
         {
             List<DateTime> insDueDates = new List<DateTime>();
             DateTime dtFin = DateTime.MinValue;
-           
+
             // Get the Dt_Fin and existing INS_DUE_DT values
             using (SqlCommand cmd = new SqlCommand("Usp_UpdateInsDueDate", con, trans))
             {
@@ -169,12 +171,12 @@ namespace BulkSMPosting.Logics.BLL
 
                         if (dtFin == null)
                             //if (!reader.IsDBNull(0))
-                                dtFin = reader.GetDateTime(0);
+                            dtFin = reader.GetDateTime(0);
 
                         if (!reader.IsDBNull(1))
                             insDueDates.Add(reader.GetDateTime(1));
                     }
-                } 
+                }
             }
             if (dtFin == DateTime.MinValue)
             {
@@ -238,41 +240,59 @@ namespace BulkSMPosting.Logics.BLL
             string todate = DateTime.Now.ToString("yyyy-MM-dd");
             string fromdate = DateTime.Now.AddDays(-2).ToString("yyyy-MM-dd");
 
-            using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString("defaultconnection")))
+            try
             {
-                using (SqlCommand cmd = new SqlCommand())
+                using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString("defaultconnection")))
                 {
-                    cmd.CommandType = CommandType.StoredProcedure;
-                    cmd.CommandText = "Usp_BulkSmPost";
-                    cmd.Parameters.AddWithValue("@todate", todate);
-                    cmd.Parameters.AddWithValue("@fromdate", fromdate);
-                    cmd.Connection = con;
-                    if (con.State != ConnectionState.Open)
-                        con.Open();
-                    SqlDataReader reader = cmd.ExecuteReader();
-
-                    while (reader.Read())
+                    using (SqlCommand cmd = new SqlCommand("Usp_BulkSmPost", con))
                     {
-                        SMPostVM item = new SMPostVM();
-                        item.SMCode = reader["CODE"].ToString();
-                        item.ParytCode = reader["PARTY_CD"].ToString();
-                        item.CustName = reader["SUBS_NAME"].ToString();
-                        item.LoanAmt = Convert.ToString(reader["INVEST"]);
-                        item.Duration = Convert.ToString(reader["DURATION"]);
-                        item.Creator = reader["Creator"].ToString();
-                        item.PostSM = Convert.ToString(reader["PostSM"]);
-                        item.FiCode = reader["FiCode"].ToString();
-                        item.PaymentDate = reader["PaymentDate"] != DBNull.Value ? (DateTime)Convert.ToDateTime(reader["PaymentDate"]) : DateTime.MinValue;
-                        item.FiId = (long)reader["FiId"];
-                        dataList.Add(item);
+                        cmd.CommandType = CommandType.StoredProcedure;
+                        cmd.Parameters.AddWithValue("@todate", todate);
+                        cmd.Parameters.AddWithValue("@fromdate", fromdate);
+
+                        con.Open();
+
+                        using (SqlDataReader reader = cmd.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                SMPostVM item = new SMPostVM
+                                {
+                                    SMCode = reader["CODE"].ToString(),
+                                    ParytCode = reader["PARTY_CD"].ToString(),
+                                    CustName = reader["SUBS_NAME"].ToString(),
+                                    LoanAmt = Convert.ToString(reader["INVEST"]),
+                                    Duration = Convert.ToString(reader["DURATION"]),
+                                    Creator = reader["Creator"].ToString(),
+                                    PostSM = Convert.ToString(reader["PostSM"]),
+                                    FiCode = reader["FiCode"].ToString(),
+                                    PaymentDate = reader["PaymentDate"] != DBNull.Value? Convert.ToDateTime(reader["PaymentDate"]): DateTime.MinValue,
+                                    FiId = Convert.ToInt64(reader["FiId"])
+                                };
+
+                                dataList.Add(item);
+                            }
+                        }
                     }
-                    reader.Close();
-                    con.Close();
-                    cmd.Dispose();
+                }
+
+                if (dataList.Count == 0)
+                {
+                    Console.WriteLine($"No data found between {fromdate} and {todate}.");
+                }
+                else
+                {
+                    Console.WriteLine($"{dataList.Count} record(s) found between {fromdate} and {todate}.");
                 }
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine("An error occurred while retrieving data: " + ex.Message);
+            }
+
             return RemoveDuplicatesFromList(dataList, r => new { r.SMCode });
         }
+
         public static List<T> RemoveDuplicatesFromList<T, TKey>(List<T> list, Func<T, TKey> keySelector)
         {
             HashSet<TKey> set = new HashSet<TKey>();
