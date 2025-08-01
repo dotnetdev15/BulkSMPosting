@@ -19,136 +19,123 @@ namespace BulkSMPosting.Logics.BLL
         public async Task SMPost()
         {
             string activeKey = _configuration.GetSection("ConnectionStrings:active").Value;
+            string connectionString = _configuration.GetConnectionString(activeKey);
 
-            using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString(activeKey)))
+            using (SqlConnection con = new SqlConnection(connectionString))
             {
                 await con.OpenAsync();
+
                 try
                 {
-                    List<SMPostVM> obj = GetRecordsFromSMPost();
-                    if (obj.Count > 0)
+                    List<SMPostVM> obj = GetRecordsFromSMPost(con);
+
+                    if (obj.Count == 0)
                     {
-                        SqlCommand cmd = new SqlCommand();
+                        Console.WriteLine("No records to process.");
+                        return;
+                    }
+                    SqlCommand cmd = new SqlCommand
+                    {
+                        CommandType = CommandType.Text,
+                        Connection = con
+                    };
+                    cmd.Parameters.Add("@SmCode", SqlDbType.VarChar, 10);
 
-                        cmd.CommandType = CommandType.Text;
-                        cmd.Parameters.Add("@SmCode", SqlDbType.VarChar, 10);
-                        cmd.Connection = con;
+                    string UserID = "11399";
+                    List<string> smCodesForPdlShares = new List<string>();
 
-                        string UserID = "169";
-                        List<string> smCodesForPdlShares = new List<string>();
-                        DateTime TDate = DateTime.Now;
-                        foreach (var item in obj)
+                    foreach (var item in obj)
+                    {
+                        SqlTransaction tr = null;
+                        try
                         {
-                            int IsPosted = 0;
-                            Int32 result = 0;
                             string code = item.SMCode;
-                            string PartyCD = item.ParytCode;
-                            string Location = item.Creator;
-                            string BankCode = item.AheadsMain;
-                            string ficode = item.FiCode;
-                            int fiId = (int)item.FiId;
-                            string Remarks = null;
-                            DateTime paymentdate = (DateTime)item.PaymentDate;
                             cmd.Parameters["@SmCode"].Value = code;
 
-
-                            using (SqlConnection conn = new SqlConnection(_configuration.GetConnectionString("defaultconnection")))
+                            // Check if Fi_Id exists in PDLSBI..SBILoanDisbStatus
+                            int result = 0;
+                            using (SqlCommand checkCmd = new SqlCommand("SELECT 1 FROM PDLSBI..SBILoanDisbStatus WHERE Fi_Id = @fiId", con))
                             {
-                                SqlCommand cmds = new SqlCommand();
-                                cmds.CommandType = CommandType.Text;
-                                Console.WriteLine($"FiCode: {ficode}, FiCreator: {Location}");
-                                cmds.Parameters.Add("@fiId", SqlDbType.BigInt).Value = fiId;
-                                cmds.Parameters.Add("@Creator", SqlDbType.VarChar).Value = Location.Trim();
-                                cmds.CommandText = @"SELECT 1 FROM PDLSBI..SBILoanDisbStatus WHERE Fi_Id = @fiId";
-                                cmds.Connection = conn;
-                                conn.Open();
-
-                                //1.s checking that account number exist or not fro SBI Case only
-                                result = Convert.ToInt32(cmds.ExecuteScalar() ?? 0);
+                                checkCmd.Parameters.Add("@fiId", SqlDbType.BigInt).Value = item.FiId;
+                                object scalarResult = await checkCmd.ExecuteScalarAsync();
+                                result = (scalarResult != null) ? Convert.ToInt32(scalarResult) : 0;
                             }
 
-                            //2.s check in sm table already posted or not  
-                            cmd.CommandText = @"select 1 from SM WHERE CODE=@SmCode";
-                            IsPosted = Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
+                            // Check if already posted in SM table
+                            cmd.CommandText = @"SELECT 1 FROM SM WHERE CODE = @SmCode";
+                            int IsPosted = Convert.ToInt32(await cmd.ExecuteScalarAsync() ?? 0);
 
+                            DateTime paymentDate = (DateTime)item.PaymentDate;
 
-                            //3.if this candition is true then this part of code is run
-                            if (result > 0 || paymentdate != null && IsPosted == 0)
+                            if (result > 0 || paymentDate != DateTime.MinValue && IsPosted == 0)
                             {
                                 tr = con.BeginTransaction();
-                                string DTFin = "";
-                                if (item.PaymentDate != DateTime.MinValue)
-                                {
-                                    DateTime paymentDate = (DateTime)item.PaymentDate;
-                                    UpdateInsDueDate(code, paymentDate, con, tr);
-                                    DTFin = paymentDate.ToString("yyyy-MM-dd hh:mm:ss tt");
-                                }
-
                                 cmd.Transaction = tr;
 
-                                UpdateSmAndChq(code, DTFin, UserID, con, tr);
+                                if (paymentDate != DateTime.MinValue)
+                                {
+                                    UpdateInsDueDate(code, paymentDate, con, tr);
+                                }
+
+                                if (activeKey.Equals("defaultconnections"))
+                                {
+                                    Console.WriteLine($"Calling UpdateSmAndChq with code={code}, DTFin={paymentDate}, UserID={UserID}");
+                                    UpdateSmAndChq(code, paymentDate, UserID, con, tr);
+
+                                    Console.WriteLine("UpdateSmAndChq completed.");
+                                }
 
                                 smCodesForPdlShares.Add(code);
-
-                                UpdateStatusForSmPost(code, con, tr);
-
                                 tr.Commit();
-                            }
+                                tr = null;
+                                Console.WriteLine($"Transaction committed successfully for code: {code}");
 
-                            else
-                            {
-                                if (result == 0)
+                                if (IsSmCodeExistsInSmAndChq(code))
                                 {
-
-                                    Remarks = "Account Number Not Found";
-
-                                    if (result == 0 && paymentdate == null)
+                                    if (activeKey.Equals("defaultconnection"))
                                     {
-                                        Remarks = "Account Number and PaymentDate Not Found";
+                                        UpdateSmAndChq(code, paymentDate, UserID, con, tr);
+                                        UpdateStatusForSmPost(code, con, tr);
                                     }
                                 }
+                                //tr.Commit();                             
+                            }
+                            else
+                            {
+                                string remarks = null;
 
-                                else if (paymentdate == null)
-                                {
+                                if (result == 0 && paymentDate == DateTime.MinValue)
+                                    remarks = "Account Number and PaymentDate Not Found";
+                                else if (result == 0)
+                                    remarks = "Account Number Not Found";
+                                else if (paymentDate == DateTime.MinValue)
+                                    remarks = "PaymentDate is not found";
 
-                                    Remarks = "PaymentDate is not found";
-                                }
-
-                                if (Remarks != null)
-                                {
-                                    //4.dumping values of unposted SM in NotPostedSM table
-                                    //using (SqlCommand cmdn = new SqlCommand())
-                                    //{
-                                    //    cmdn.CommandType = CommandType.Text;
-
-                                    //    cmdn.Parameters.AddWithValue("@SmCode", code);
-                                    //    cmdn.Parameters.AddWithValue("@Remarks", Remarks);
-                                    //    cmdn.CommandText = @"insert into NotPostedSM(SmCode,Remarks,Date)" +
-                                    //                      "values(@SmCode,@Remarks,GETDATE())";
-                                    //    cmdn.ExecuteNonQuery();
-                                    //}
-                                }
+                                Console.WriteLine($"Skipping code {code}: {remarks}");
                             }
                         }
-                        //5.new procedure fo smtransfer
-                        //  zgenerateAllPdlShares(smCodesForPdlShares, con);
-
-                        //6.Sending Unposted Sm on mail with remarks
-                        // EmailSend();
+                        catch (Exception ex)
+                        {
+                            if (tr != null)
+                            {
+                                try { tr.Rollback(); } catch { }
+                            }
+                            Console.WriteLine($"Error processing SMCode {item.SMCode}: {ex.Message}");
+                            Helper.InsertLogException(ex, _configuration, "SMPOST_Schedular");
+                            throw;
+                        }
                     }
-
                 }
-                catch (SqlException ex)
+                catch (Exception ex)
                 {
-                    tr.Rollback();
+                    Console.WriteLine($"Fatal error in SMPost: {ex.Message}");
                     Helper.InsertLogException(ex, _configuration, "SMPOST_Schedular");
-
+                    throw;
                 }
                 finally
                 {
                     if (con != null && con.State == ConnectionState.Open)
-                        con.Close();
-
+                        await con.CloseAsync();
                     con?.Dispose();
                 }
             }
@@ -168,7 +155,6 @@ namespace BulkSMPosting.Logics.BLL
                 {
                     while (reader.Read())
                     {
-
                         if (dtFin == null)
                             //if (!reader.IsDBNull(0))
                             dtFin = reader.GetDateTime(0);
@@ -178,11 +164,11 @@ namespace BulkSMPosting.Logics.BLL
                     }
                 }
             }
-            if (dtFin == DateTime.MinValue)
-            {
-                Console.WriteLine("Dt_Fin not found for the given code.");
-                return;
-            }
+            //if (dtFin == DateTime.MinValue)
+            //{
+            //    Console.WriteLine("Dt_Fin not found for the given code.");
+            //    return;
+            //}
 
             var batchQuery = new List<string>();
             DateTime prevInsDueDate = startDate;
@@ -234,44 +220,42 @@ namespace BulkSMPosting.Logics.BLL
             return targetDate;
         }
 
-        public List<SMPostVM> GetRecordsFromSMPost()
+        public List<SMPostVM> GetRecordsFromSMPost(SqlConnection con)
         {
             List<SMPostVM> dataList = new List<SMPostVM>();
             string todate = DateTime.Now.ToString("yyyy-MM-dd");
             string fromdate = DateTime.Now.AddDays(-2).ToString("yyyy-MM-dd");
 
+            //string todate = "2025 -07 -30";
+            //string fromdate = "2025-03-29";
+
             try
-            {
-                using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString("defaultconnection")))
+            {              
+                using (SqlCommand cmd = new SqlCommand("Usp_BulkSmPost", con))
                 {
-                    using (SqlCommand cmd = new SqlCommand("Usp_BulkSmPost", con))
+                    cmd.CommandType = CommandType.StoredProcedure;
+                    cmd.Parameters.AddWithValue("@todate", todate);
+                    cmd.Parameters.AddWithValue("@fromdate", fromdate);
+
+                    using (SqlDataReader reader = cmd.ExecuteReader())
                     {
-                        cmd.CommandType = CommandType.StoredProcedure;
-                        cmd.Parameters.AddWithValue("@todate", todate);
-                        cmd.Parameters.AddWithValue("@fromdate", fromdate);
-
-                        con.Open();
-
-                        using (SqlDataReader reader = cmd.ExecuteReader())
+                        while (reader.Read())
                         {
-                            while (reader.Read())
+                            SMPostVM item = new SMPostVM
                             {
-                                SMPostVM item = new SMPostVM
-                                {
-                                    SMCode = reader["CODE"].ToString(),
-                                    ParytCode = reader["PARTY_CD"].ToString(),
-                                    CustName = reader["SUBS_NAME"].ToString(),
-                                    LoanAmt = Convert.ToString(reader["INVEST"]),
-                                    Duration = Convert.ToString(reader["DURATION"]),
-                                    Creator = reader["Creator"].ToString(),
-                                    PostSM = Convert.ToString(reader["PostSM"]),
-                                    FiCode = reader["FiCode"].ToString(),
-                                    PaymentDate = reader["PaymentDate"] != DBNull.Value? Convert.ToDateTime(reader["PaymentDate"]): DateTime.MinValue,
-                                    FiId = Convert.ToInt64(reader["FiId"])
-                                };
+                                SMCode = reader["CODE"].ToString(),
+                                ParytCode = reader["PARTY_CD"].ToString(),
+                                CustName = reader["SUBS_NAME"].ToString(),
+                                LoanAmt = Convert.ToString(reader["INVEST"]),
+                                Duration = Convert.ToString(reader["DURATION"]),
+                                Creator = reader["Creator"].ToString(),
+                                PostSM = Convert.ToString(reader["PostSM"]),
+                                FiCode = reader["FiCode"].ToString(),
+                                PaymentDate = reader["PaymentDate"] != DBNull.Value ? Convert.ToDateTime(reader["PaymentDate"]) : DateTime.MinValue,
+                                FiId = Convert.ToInt64(reader["FiId"])
+                            };
 
-                                dataList.Add(item);
-                            }
+                            dataList.Add(item);
                         }
                     }
                 }
@@ -309,23 +293,30 @@ namespace BulkSMPosting.Logics.BLL
             return uniqueList;
         }
 
-        //Insertion values in sm and fichq table
-        public void UpdateSmAndChq(string code, string DTFin, string UserID, SqlConnection con, SqlTransaction trans)
+        //Insertion values in sm and chq table     
+        public void UpdateSmAndChq(string code, DateTime DTFin, string UserID, SqlConnection con, SqlTransaction trans)
         {
-            SqlCommand cmd = new SqlCommand
+            try
             {
-                CommandType = CommandType.StoredProcedure,
-                CommandText = "Usp_InsertIntoSmAndChq",
-                Connection = con,
-                Transaction = trans,
-                CommandTimeout = 0
-            };
+                SqlCommand cmd = new SqlCommand
+                {
+                    CommandType = CommandType.StoredProcedure,
+                    CommandText = "Usp_InsertIntoSmAndChq",
+                    Connection = con,
+                    Transaction = trans,
+                    CommandTimeout = 0
+                };
 
-            cmd.Parameters.Add("@SmCode", SqlDbType.VarChar).Value = code;
-            cmd.Parameters.Add("@DTFin", SqlDbType.VarChar).Value = DTFin;
-            cmd.Parameters.Add("@UserID", SqlDbType.VarChar).Value = UserID;
+                cmd.Parameters.Add("@SmCode", SqlDbType.VarChar).Value = code;
+                cmd.Parameters.Add("@DTFin", SqlDbType.DateTime).Value = DTFin;
+                cmd.Parameters.Add("@UserID", SqlDbType.VarChar).Value = UserID;
 
-            cmd.ExecuteNonQuery();
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception)
+            {
+                throw;
+            }
         }
 
         //Updating status in SmCaseForPost status=0 for posted sm
@@ -341,27 +332,34 @@ namespace BulkSMPosting.Logics.BLL
 
             cmd.ExecuteNonQuery();
         }
+        public bool IsSmCodeExistsInSmAndChq(string smCode)
+        {
+            using (SqlConnection con = new SqlConnection(_configuration.GetConnectionString("defaultconnections")))
+            {
+                con.Open();
 
-        //final call of SM Post method
-        //public void GenerateAllPdlShares(List<string> smCodesForPdlShares, SqlConnection con)
-        //{
-        //    string smCodeList = string.Join(",", smCodesForPdlShares);
-        //    DateTime todate = DateTime.Now;
-        //    DateTime fromdate = todate.AddDays(-2);
+                // Check in chq
+                string chqQuery = @"IF EXISTS (SELECT 1 FROM chq WHERE CODE = @SmCode) SELECT 1 ELSE SELECT 0";
+                using (SqlCommand chqCmd = new SqlCommand(chqQuery, con))
+                {
+                    chqCmd.Parameters.AddWithValue("@SmCode", smCode);
+                    chqCmd.CommandTimeout = 120;
+                    int chqExists = (int)chqCmd.ExecuteScalar();
+                    if (chqExists == 0)
+                        return false;
+                }
 
+                // Check in sm
+                string smQuery = @"IF EXISTS (SELECT 1 FROM sm WHERE CODE = @SmCode) SELECT 1 ELSE SELECT 0";
+                using (SqlCommand smCmd = new SqlCommand(smQuery, con))
+                {
+                    smCmd.Parameters.AddWithValue("@SmCode", smCode);
+                    smCmd.CommandTimeout = 120;
+                    int smExists = (int)smCmd.ExecuteScalar();
+                    return smExists == 1;
+                }
+            }
+        }
 
-        //    SqlCommand cmd = new SqlCommand
-        //    {
-        //        CommandType = CommandType.StoredProcedure,
-        //        CommandText = "zGenAllPdlShareJaspreet",
-        //        Connection = con,
-        //        CommandTimeout = 0
-        //    };
-
-        //    cmd.Parameters.AddWithValue("@todate", todate);
-        //    cmd.Parameters.AddWithValue("@fromdate", fromdate);
-
-        //    cmd.ExecuteNonQuery();
-        //}
     }
 }
