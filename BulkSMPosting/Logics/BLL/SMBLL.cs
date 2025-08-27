@@ -84,8 +84,10 @@ namespace BulkSMPosting.Logics.BLL
 
                                     Console.WriteLine("UpdateSmAndChq completed.");
                                 }
-
+                               
                                 smCodesForPdlShares.Add(code);
+                                UpdateStatusForSmPost(code, con, tr);
+
                                 tr.Commit();
                                 tr = null;
                                 Console.WriteLine($"Transaction committed successfully for code: {code}");
@@ -237,7 +239,7 @@ namespace BulkSMPosting.Logics.BLL
                     cmd.Parameters.AddWithValue("@todate", todate);
                     cmd.Parameters.AddWithValue("@fromdate", fromdate);
 
-                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    using (SqlDataReader reader = cmd.ExecuteReader())     
                     {
                         while (reader.Read())
                         {
